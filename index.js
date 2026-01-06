@@ -18,7 +18,7 @@ app.get('/health', (req, res) => {
 });
 
 // --- test write to sheet ---
-app.get('/test-write', async (req, res) => {
+app.all('/test-write', async (req, res) => {
   try {
     const values = [[
       `test_${Date.now()}`,
