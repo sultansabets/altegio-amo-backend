@@ -1,11 +1,13 @@
 import express from 'express';
+import fetch from 'node-fetch';
+import cron from 'node-cron';
 import { google } from 'googleapis';
 
 const app = express();
 app.use(express.json());
 
 // ===============================
-// Google Sheets setup
+// Google Sheets
 // ===============================
 const auth = new google.auth.GoogleAuth({
   credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON),
@@ -24,36 +26,61 @@ function normalizePhone(phone) {
   return p;
 }
 
-async function eventExists(eventId) {
+async function getRows() {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    range: 'Payments!A:A',
+    range: 'Payments!A2:L',
   });
-  const rows = res.data.values || [];
-  return rows.some(row => row[0] === eventId);
+  return res.data.values || [];
 }
 
-async function writeToSheet(data) {
-  const values = [[
-    data.event_id,
-    data.client_phone,
-    data.client_name,
-    data.booking_id,
-    data.service_name,
-    data.payment_type,
-    data.payment_amount,
-    data.payment_method,
-    data.payment_status,
-    data.payment_datetime,
-    '',
-    'new'
-  ]];
-
-  await sheets.spreadsheets.values.append({
+async function updateRow(rowIndex, amoLeadId, status) {
+  await sheets.spreadsheets.values.update({
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    range: 'Payments!A1',
+    range: `Payments!K${rowIndex}:L${rowIndex}`,
     valueInputOption: 'RAW',
-    requestBody: { values },
+    requestBody: {
+      values: [[amoLeadId, status]],
+    },
+  });
+}
+
+// ===============================
+// amoCRM helpers
+// ===============================
+async function amoRequest(path, method = 'GET', body = null) {
+  const res = await fetch(`${process.env.AMO_BASE_URL}${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${process.env.AMO_ACCESS_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: body ? JSON.stringify(body) : null,
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text);
+  }
+
+  return res.json();
+}
+
+async function findLeadInPipelineByPhone(phone) {
+  const res = await amoRequest(`/api/v4/contacts?query=${phone}`);
+  const contact = res?._embedded?.contacts?.[0];
+  if (!contact) return null;
+
+  const pipelineId = Number(process.env.AMO_PIPELINE_ID);
+  const leads = contact._embedded?.leads || [];
+
+  return leads.find(l => l.pipeline_id === pipelineId) || null;
+}
+
+async function updateLead(leadId, statusId, fields) {
+  await amoRequest(`/api/v4/leads/${leadId}`, 'PATCH', {
+    status_id: statusId,
+    custom_fields_values: fields,
   });
 }
 
@@ -65,73 +92,82 @@ app.get('/health', (req, res) => {
 });
 
 // ===============================
-// Altegio Webhook (БОЕВОЙ)
+// Altegio webhook (приём)
 // ===============================
-app.post('/webhook/altegio', async (req, res) => {
+app.post('/webhook/altegio', (req, res) => {
+  console.log('ALTEGIO EVENT:', JSON.stringify(req.body));
+  res.json({ status: 'accepted' });
+});
+
+// ===============================
+// CRON: Sheets → amoCRM
+// ===============================
+cron.schedule('*/3 * * * *', async () => {
+  console.log('CRON START');
+
   try {
-    const payload = req.body;
+    const rows = await getRows();
 
-    /**
-     * ОЖИДАЕМЫЕ ПОЛЯ (Altegio может прислать больше):
-     * payload.event            -> 'payment.created' | 'payment.canceled' | 'booking.created'
-     * payload.booking.id
-     * payload.booking.service.title
-     * payload.client.phone
-     * payload.client.name
-     * payload.payment.id
-     * payload.payment.amount
-     * payload.payment.method
-     * payload.payment.total_price   (если есть — для определения full)
-     */
+    for (let i = 0; i < rows.length; i++) {
+      const [
+        event_id,
+        phone,
+        ,
+        ,
+        ,
+        payment_type,
+        payment_amount,
+        ,
+        payment_status,
+        payment_datetime,
+        amo_lead_id,
+        sync_status,
+      ] = rows[i];
 
-    console.log('RAW ALTEGIO:', JSON.stringify(payload));
+      if (sync_status !== 'new') continue;
 
-    const bookingId = payload?.booking?.id || payload?.booking_id || '';
-    const paymentId = payload?.payment?.id || '';
-    const clientPhone = normalizePhone(payload?.client?.phone || '');
-    const clientName = payload?.client?.name || '';
-    const serviceName = payload?.booking?.service?.title || payload?.service?.title || '';
+      const lead = await findLeadInPipelineByPhone(phone);
+      if (!lead) {
+        await updateRow(i + 2, '', 'error');
+        continue;
+      }
 
-    if (!bookingId || !clientPhone) {
-      return res.status(400).json({ error: 'bookingId or phone missing' });
+      const fields = [];
+
+      if (payment_type === 'prepayment') {
+        fields.push({
+          field_id: Number(process.env.AMO_FIELD_PREPAY_SUM),
+          values: [{ value: payment_amount }],
+        });
+      }
+
+      if (payment_type === 'full') {
+        fields.push({
+          field_id: Number(process.env.AMO_FIELD_FULLPAY_SUM),
+          values: [{ value: payment_amount }],
+        });
+      }
+
+      fields.push({
+        field_id: Number(process.env.AMO_FIELD_PAY_TYPE),
+        values: [{ value: payment_type }],
+      });
+
+      fields.push({
+        field_id: Number(process.env.AMO_FIELD_PAY_DATE),
+        values: [{ value: payment_datetime }],
+      });
+
+      const statusId =
+        payment_type === 'full'
+          ? Number(process.env.AMO_STATUS_FULLPAY)
+          : Number(process.env.AMO_STATUS_PREPAY);
+
+      await updateLead(lead.id, statusId, fields);
+      await updateRow(i + 2, lead.id, 'sent');
     }
-
-    // --- Определяем тип события
-    let paymentStatus = 'paid';
-    if (payload?.event === 'payment.canceled') paymentStatus = 'canceled';
-
-    const amount = Number(payload?.payment?.amount || 0);
-    const totalPrice = Number(payload?.payment?.total_price || 0);
-
-    let paymentType = 'prepayment';
-    if (totalPrice && amount >= totalPrice) paymentType = 'full';
-
-    // --- Стабильный event_id (защита от дублей)
-    const eventId = `altegio_${bookingId}_${paymentId || payload.event || 'event'}`;
-
-    const event = {
-      event_id: eventId,
-      client_phone: clientPhone,
-      client_name: clientName,
-      booking_id: bookingId,
-      service_name: serviceName,
-      payment_type: paymentType,
-      payment_amount: amount,
-      payment_method: payload?.payment?.method || '',
-      payment_status: paymentStatus,
-      payment_datetime: new Date().toISOString(),
-    };
-
-    // --- Дедупликация
-    if (await eventExists(event.event_id)) {
-      return res.json({ status: 'duplicate' });
-    }
-
-    await writeToSheet(event);
-    return res.json({ status: 'ok' });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: err.message });
+    console.error('CRON ERROR:', err.message);
   }
 });
 
