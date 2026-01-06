@@ -16,7 +16,7 @@ const auth = new google.auth.GoogleAuth({
 const sheets = google.sheets({ version: 'v4', auth });
 
 // ===============================
-// Utils
+// Sheets helpers
 // ===============================
 async function getRows() {
   const res = await sheets.spreadsheets.values.get({
@@ -36,7 +36,7 @@ async function updateRow(rowIndex, amoLeadId, status) {
 }
 
 // ===============================
-// amoCRM helpers (FIXED)
+// amoCRM helpers (ROBUST)
 // ===============================
 async function amoRequest(path, method = 'GET', body = null) {
   const res = await fetch(`${process.env.AMO_BASE_URL}${path}`, {
@@ -48,32 +48,34 @@ async function amoRequest(path, method = 'GET', body = null) {
     body: body ? JSON.stringify(body) : null,
   });
 
+  // 204 — валидный ответ (нет данных)
+  if (res.status === 204) return null;
+
   const text = await res.text();
 
   if (!res.ok) {
-    console.error('amoCRM ERROR RESPONSE:', text);
+    console.error('amoCRM ERROR:', res.status, text);
     throw new Error(`amoCRM ${res.status}`);
   }
 
-  if (!text) {
-    throw new Error('amoCRM returned empty response');
-  }
+  if (!text) return null;
 
   try {
     return JSON.parse(text);
-  } catch (e) {
-    console.error('amoCRM NON-JSON RESPONSE:', text);
-    throw new Error('amoCRM response is not JSON');
+  } catch {
+    console.error('amoCRM NON-JSON:', text);
+    return null;
   }
 }
 
 async function findLeadInPipelineByPhone(phone) {
   const data = await amoRequest(`/api/v4/contacts?query=${phone}`);
-  const contact = data?._embedded?.contacts?.[0];
-  if (!contact) return null;
+  if (!data || !data._embedded?.contacts?.length) return null;
 
+  const contact = data._embedded.contacts[0];
   const pipelineId = Number(process.env.AMO_PIPELINE_ID);
   const leads = contact._embedded?.leads || [];
+
   return leads.find(l => l.pipeline_id === pipelineId) || null;
 }
 
@@ -90,7 +92,7 @@ async function updateLead(leadId, statusId, fields) {
 app.get('/health', (req, res) => res.send('ok'));
 
 // ===============================
-// CRON
+// CRON: Sheets → amoCRM
 // ===============================
 cron.schedule('*/3 * * * *', async () => {
   console.log('CRON START');
@@ -118,7 +120,8 @@ cron.schedule('*/3 * * * *', async () => {
 
       const lead = await findLeadInPipelineByPhone(phone);
       if (!lead) {
-        await updateRow(i + 2, '', 'error');
+        console.warn(`Lead not found for phone ${phone}`);
+        await updateRow(i + 2, '', 'not_found');
         continue;
       }
 
@@ -157,10 +160,12 @@ cron.schedule('*/3 * * * *', async () => {
       await updateRow(i + 2, lead.id, 'sent');
     }
   } catch (e) {
-    console.error('CRON FATAL:', e.message);
+    console.error('CRON ERROR:', e.message);
   }
 });
 
 // ===============================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server running on ${PORT}`);
+});
