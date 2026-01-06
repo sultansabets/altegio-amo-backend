@@ -6,145 +6,149 @@ import { google } from "googleapis";
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// ================== CONFIG ==================
-const AMO_DOMAIN = "clinicreformatormen.amocrm.ru";
-const AMO_TOKEN = process.env.AMO_TOKEN;
-const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
+/* ===================== НАСТРОЙКИ ===================== */
+
+const AMO_DOMAIN = "https://clinicreformatormen.amocrm.ru";
+const AMO_TOKEN = process.env.AMO_ACCESS_TOKEN;
 
 const PIPELINE_ID = 9884630;
-const STATUS_PREPAYMENT = 81391378;   // Записан / ПРЕДОПЛАТА ПОЛУЧЕНА
-const STATUS_FULLPAYMENT = 79666150;  // ПОЛНОСТЬЮ ОПЛАТИЛ
+const STATUS_PREPAY = 81391378;
+const STATUS_FULLPAY = 79666150;
 
-// ================== GOOGLE ==================
+// поля amoCRM
+const FIELD_PAYMENT_TYPE = 1077303;
+const FIELD_PREPAY = 1026233;
+const FIELD_FULLPAY = 1077301;
+const FIELD_PAYMENT_DATE = 1077305;
+
+// Google Sheets
+const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
+const SHEET_NAME = "Payments";
+
+/* ===================== GOOGLE ===================== */
+
 const auth = new google.auth.GoogleAuth({
   credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON),
-  scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+  scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
 });
 
-const sheetsApi = google.sheets({ version: "v4", auth });
+const sheets = google.sheets({ version: "v4", auth });
 
-// ================== AMO AXIOS ==================
+/* ===================== AMO ===================== */
+
 const amo = axios.create({
-  baseURL: `https://${AMO_DOMAIN}/api/v4`,
+  baseURL: `${AMO_DOMAIN}/api/v4`,
   headers: {
     Authorization: `Bearer ${AMO_TOKEN}`,
     "Content-Type": "application/json",
   },
 });
 
-// ================== CORE LOGIC ==================
+/* ===================== ОСНОВНАЯ ЛОГИКА ===================== */
+
 async function processPayments() {
   console.log("=== PROCESS PAYMENTS START ===");
 
-  const sheet = await sheetsApi.spreadsheets.values.get({
+  const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
-    range: "A2:E", // ✅ универсально, не зависит от имени листа
+    range: `${SHEET_NAME}!A2:L`,
   });
 
-  const rows = sheet.data.values || [];
+  const rows = res.data.values || [];
   console.log("Rows from sheet:", rows.length);
 
   for (const row of rows) {
-    const [phone, paymentType, prepay, fullpay, date] = row;
-    if (!phone) continue;
+    const phoneRaw = row[1];          // B client_phone
+    const paymentType = row[5];       // F payment_type
+    const amount = row[6];            // G payment_amount
+    const paymentDate = row[9];       // J payment_datetime
 
+    if (!phoneRaw || !paymentType || !amount) continue;
+
+    const phone = phoneRaw.replace(/\D/g, "");
     console.log("Processing phone:", phone);
 
-    // 1️⃣ FIND CONTACT BY PHONE
-    const contactsRes = await amo.get("/contacts", {
-      params: { query: phone },
+    // 1. Контакт
+    const contacts = await amo.get("/contacts", {
+      params: { query: phone, with: "leads" },
     });
 
-    const contact = contactsRes.data?._embedded?.contacts?.[0];
+    const contact = contacts.data._embedded?.contacts?.[0];
     if (!contact) {
-      console.log("Contact not found:", phone);
+      console.log("No contact for phone", phone);
       continue;
     }
 
-    console.log("Matched contact ID:", contact.id);
+    // 2. Сделка в нужной воронке
+    const leads = contact._embedded?.leads || [];
+    let targetLead = null;
 
-    // 2️⃣ FIND LEAD IN TARGET PIPELINE BY CONTACT
-    const leadsRes = await amo.get("/leads", {
-      params: {
-        "filter[contacts][id]": contact.id,
-        "filter[pipeline_id]": PIPELINE_ID,
-        "order[created_at]": "desc",
-        limit: 1,
-      },
-    });
+    for (const l of leads) {
+      const lead = await amo.get(`/leads/${l.id}`);
+      if (lead.data.pipeline_id === PIPELINE_ID) {
+        targetLead = lead.data;
+        break;
+      }
+    }
 
-    const lead = leadsRes.data?._embedded?.leads?.[0];
-    if (!lead) {
-      console.log("No lead in pipeline for contact:", contact.id);
+    if (!targetLead) {
+      console.log("No lead in target pipeline for phone", phone);
       continue;
     }
 
-    console.log("Matched lead ID:", lead.id);
+    console.log("Target lead:", targetLead.id);
 
-    // 3️⃣ PREPARE CUSTOM FIELDS
+    // 3. Подготовка полей
     const customFields = [];
 
-    if (prepay) {
+    if (paymentType === "prepayment") {
       customFields.push({
-        field_id: 1026233,
-        values: [{ value: Number(prepay) }],
+        field_id: FIELD_PREPAY,
+        values: [{ value: Number(amount) }],
       });
     }
 
-    if (fullpay) {
+    if (paymentType === "full") {
       customFields.push({
-        field_id: 1077301,
-        values: [{ value: Number(fullpay) }],
+        field_id: FIELD_FULLPAY,
+        values: [{ value: Number(amount) }],
       });
     }
 
-    if (paymentType) {
+    customFields.push({
+      field_id: FIELD_PAYMENT_TYPE,
+      values: [{ enum_code: paymentType }],
+    });
+
+    if (paymentDate) {
       customFields.push({
-        field_id: 1077303,
-        values: [
-          {
-            enum_id: paymentType === "prepayment" ? 837451 : 837453,
-          },
-        ],
+        field_id: FIELD_PAYMENT_DATE,
+        values: [{ value: paymentDate }],
       });
     }
 
-    if (date) {
-      customFields.push({
-        field_id: 1077305,
-        values: [{ value: date }],
-      });
-    }
-
-    // 4️⃣ MOVE STATUS BY PAYMENT TYPE
-    const targetStatus =
-      paymentType === "prepayment"
-        ? STATUS_PREPAYMENT
-        : paymentType === "full"
-        ? STATUS_FULLPAYMENT
-        : lead.status_id;
-
-    await amo.patch(`/leads/${lead.id}`, {
-      status_id: targetStatus,
+    // 4. Обновление сделки
+    await amo.patch(`/leads/${targetLead.id}`, {
+      status_id: paymentType === "prepayment" ? STATUS_PREPAY : STATUS_FULLPAY,
       custom_fields_values: customFields,
     });
 
-    console.log("Lead updated successfully:", lead.id);
+    console.log(`✅ Lead ${targetLead.id} updated correctly`);
   }
 
   console.log("=== PROCESS PAYMENTS END ===");
 }
 
-// ================== CRON ==================
-cron.schedule("*/5 * * * *", async () => {
+/* ===================== CRON ===================== */
+
+cron.schedule("*/5 * * * *", () => {
   console.log("CRON START");
-  try {
-    await processPayments();
-  } catch (e) {
-    console.error("CRON ERROR:", e.response?.data || e.message);
-  }
+  processPayments().catch((e) =>
+    console.error("CRON ERROR:", e.response?.data || e.message)
+  );
 });
 
-// ================== SERVER ==================
+/* ===================== SERVER ===================== */
+
 app.get("/health", (_, res) => res.send("ok"));
 app.listen(PORT, () => console.log("Server running on", PORT));
