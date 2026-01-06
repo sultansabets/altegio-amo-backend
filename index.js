@@ -5,7 +5,7 @@ import cron from "node-cron";
 const app = express();
 app.use(express.json());
 
-/* =============== CONFIG =============== */
+/* ================== CONFIG ================== */
 
 const AMO_BASE_URL = "https://clinicreformatormen.amocrm.ru";
 const AMO_TOKEN = process.env.AMO_ACCESS_TOKEN;
@@ -20,10 +20,24 @@ const FULLPAYMENT_FIELD_ID = 1077301;
 const PAYMENT_TYPE_FIELD_ID = 1077303;
 const PAYMENT_DATE_FIELD_ID = 1077305;
 
-/* =============== HELPERS =============== */
+/* enum_id значений списка "Тип оплаты" — ОБЯЗАТЕЛЬНО */
+const PAYMENT_TYPE_ENUMS = {
+  kaspi: 1,   // ❗ ЗАМЕНИ НА РЕАЛЬНЫЕ enum_id
+  cash: 2,
+};
+
+/* ================== HELPERS ================== */
 
 function normalizePhone(phone) {
   return phone.replace(/\D/g, "").replace(/^8/, "7");
+}
+
+function extractPhones(contact) {
+  const field = contact.custom_fields_values?.find(
+    (f) => f.field_code === "PHONE"
+  );
+  if (!field) return [];
+  return field.values.map((v) => normalizePhone(v.value));
 }
 
 async function amoRequest(url, method = "GET", body = null) {
@@ -40,22 +54,29 @@ async function amoRequest(url, method = "GET", body = null) {
   return res.json();
 }
 
-/* =============== CORE LOGIC =============== */
+/* ================== CORE LOGIC ================== */
 
 async function processPayment(row) {
-  const phone = normalizePhone(row.client_phone);
-  console.log("Processing phone:", phone);
+  const targetPhone = normalizePhone(row.client_phone);
+  console.log("Processing phone:", targetPhone);
 
-  /* 1. FIND CONTACT */
-  const contactsRes = await amoRequest(`/api/v4/contacts?query=${phone}`);
-  const contact = contactsRes?._embedded?.contacts?.[0];
+  /* 1. GET CONTACTS BY QUERY */
+  const contactsRes = await amoRequest(`/api/v4/contacts?query=${targetPhone}&limit=10`);
+  const contacts = contactsRes?._embedded?.contacts || [];
+
+  /* 2. STRICT PHONE MATCH */
+  const contact = contacts.find((c) =>
+    extractPhones(c).includes(targetPhone)
+  );
 
   if (!contact) {
-    console.log("Contact not found");
+    console.log("❌ No contact with exact phone match");
     return;
   }
 
-  /* 2. FIND LEADS VIA LEADS API (CORRECT WAY) */
+  console.log("✅ Matched contact ID:", contact.id);
+
+  /* 3. FIND LEAD STRICTLY IN TARGET PIPELINE */
   const leadsRes = await amoRequest(
     `/api/v4/leads?filter[pipeline_id]=${PIPELINE_ID}&filter[contacts][id]=${contact.id}&order[updated_at]=desc&limit=1`
   );
@@ -63,19 +84,29 @@ async function processPayment(row) {
   const lead = leadsRes?._embedded?.leads?.[0];
 
   if (!lead) {
-    console.log("No active lead in target pipeline");
+    console.log("❌ No lead in target pipeline for this contact");
     return;
   }
 
-  /* 3. PREPARE FIELDS */
+  console.log("✅ Target lead ID:", lead.id);
+
+  /* 4. PREPARE FIELDS */
   const custom_fields_values = [
     {
       field_id: PAYMENT_TYPE_FIELD_ID,
-      values: [{ value: row.payment_method }],
+      values: [
+        {
+          enum_id: PAYMENT_TYPE_ENUMS[row.payment_method],
+        },
+      ],
     },
     {
       field_id: PAYMENT_DATE_FIELD_ID,
-      values: [{ value: Math.floor(Date.now() / 1000) }],
+      values: [
+        {
+          value: Math.floor(Date.now() / 1000),
+        },
+      ],
     },
   ];
 
@@ -97,7 +128,13 @@ async function processPayment(row) {
     status_id = STATUS_FULLPAYMENT;
   }
 
-  /* 4. UPDATE LEAD */
+  console.log("Updating lead with:", {
+    lead_id: lead.id,
+    status_id,
+    custom_fields_values,
+  });
+
+  /* 5. UPDATE LEAD */
   await amoRequest(`/api/v4/leads/${lead.id}`, "PATCH", {
     status_id,
     custom_fields_values,
@@ -106,23 +143,23 @@ async function processPayment(row) {
   console.log(`✅ Lead ${lead.id} updated correctly`);
 }
 
-/* =============== CRON =============== */
+/* ================== CRON ================== */
 
 cron.schedule("*/5 * * * *", async () => {
   console.log("CRON START");
 
-  // временно тест
-  const testRow = {
+  // ❗ ПОКА ТЕСТ. ЗАМЕНИМ НА GOOGLE SHEETS
+  const row = {
     client_phone: "77077599609",
-    payment_type: "prepayment",
+    payment_type: "prepayment", // prepayment | full
     payment_amount: 10000,
     payment_method: "kaspi",
   };
 
-  await processPayment(testRow);
+  await processPayment(row);
 });
 
-/* =============== SERVICE =============== */
+/* ================== SERVICE ================== */
 
 app.get("/health", (req, res) => res.send("ok"));
 
