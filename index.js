@@ -18,14 +18,6 @@ const sheets = google.sheets({ version: 'v4', auth });
 // ===============================
 // Utils
 // ===============================
-function normalizePhone(phone) {
-  if (!phone) return '';
-  let p = phone.toString().replace(/\D/g, '');
-  if (p.startsWith('8')) p = '7' + p.slice(1);
-  if (p.startsWith('7') && p.length === 11) return p;
-  return p;
-}
-
 async function getRows() {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
@@ -39,14 +31,12 @@ async function updateRow(rowIndex, amoLeadId, status) {
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
     range: `Payments!K${rowIndex}:L${rowIndex}`,
     valueInputOption: 'RAW',
-    requestBody: {
-      values: [[amoLeadId, status]],
-    },
+    requestBody: { values: [[amoLeadId, status]] },
   });
 }
 
 // ===============================
-// amoCRM helpers
+// amoCRM helpers (FIXED)
 // ===============================
 async function amoRequest(path, method = 'GET', body = null) {
   const res = await fetch(`${process.env.AMO_BASE_URL}${path}`, {
@@ -58,22 +48,32 @@ async function amoRequest(path, method = 'GET', body = null) {
     body: body ? JSON.stringify(body) : null,
   });
 
+  const text = await res.text();
+
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(text);
+    console.error('amoCRM ERROR RESPONSE:', text);
+    throw new Error(`amoCRM ${res.status}`);
   }
 
-  return res.json();
+  if (!text) {
+    throw new Error('amoCRM returned empty response');
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    console.error('amoCRM NON-JSON RESPONSE:', text);
+    throw new Error('amoCRM response is not JSON');
+  }
 }
 
 async function findLeadInPipelineByPhone(phone) {
-  const res = await amoRequest(`/api/v4/contacts?query=${phone}`);
-  const contact = res?._embedded?.contacts?.[0];
+  const data = await amoRequest(`/api/v4/contacts?query=${phone}`);
+  const contact = data?._embedded?.contacts?.[0];
   if (!contact) return null;
 
   const pipelineId = Number(process.env.AMO_PIPELINE_ID);
   const leads = contact._embedded?.leads || [];
-
   return leads.find(l => l.pipeline_id === pipelineId) || null;
 }
 
@@ -87,20 +87,10 @@ async function updateLead(leadId, statusId, fields) {
 // ===============================
 // Health
 // ===============================
-app.get('/health', (req, res) => {
-  res.send('ok');
-});
+app.get('/health', (req, res) => res.send('ok'));
 
 // ===============================
-// Altegio webhook (приём)
-// ===============================
-app.post('/webhook/altegio', (req, res) => {
-  console.log('ALTEGIO EVENT:', JSON.stringify(req.body));
-  res.json({ status: 'accepted' });
-});
-
-// ===============================
-// CRON: Sheets → amoCRM
+// CRON
 // ===============================
 cron.schedule('*/3 * * * *', async () => {
   console.log('CRON START');
@@ -110,7 +100,7 @@ cron.schedule('*/3 * * * *', async () => {
 
     for (let i = 0; i < rows.length; i++) {
       const [
-        event_id,
+        ,
         phone,
         ,
         ,
@@ -118,9 +108,9 @@ cron.schedule('*/3 * * * *', async () => {
         payment_type,
         payment_amount,
         ,
-        payment_status,
+        ,
         payment_datetime,
-        amo_lead_id,
+        ,
         sync_status,
       ] = rows[i];
 
@@ -166,13 +156,11 @@ cron.schedule('*/3 * * * *', async () => {
       await updateLead(lead.id, statusId, fields);
       await updateRow(i + 2, lead.id, 'sent');
     }
-  } catch (err) {
-    console.error('CRON ERROR:', err.message);
+  } catch (e) {
+    console.error('CRON FATAL:', e.message);
   }
 });
 
 // ===============================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on ${PORT}`));
