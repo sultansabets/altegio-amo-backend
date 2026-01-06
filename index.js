@@ -11,7 +11,6 @@ const auth = new google.auth.GoogleAuth({
   credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON),
   scopes: ['https://www.googleapis.com/auth/spreadsheets'],
 });
-
 const sheets = google.sheets({ version: 'v4', auth });
 
 // ===============================
@@ -30,7 +29,6 @@ async function eventExists(eventId) {
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
     range: 'Payments!A:A',
   });
-
   const rows = res.data.values || [];
   return rows.some(row => row[0] === eventId);
 }
@@ -60,51 +58,80 @@ async function writeToSheet(data) {
 }
 
 // ===============================
-// Health check
+// Health
 // ===============================
 app.get('/health', (req, res) => {
   res.send('ok');
 });
 
 // ===============================
-// Altegio webhook (RAW)
+// Altegio Webhook (БОЕВОЙ)
 // ===============================
 app.post('/webhook/altegio', async (req, res) => {
   try {
     const payload = req.body;
 
-    // ⚠️ ПОКА просто логируем
-    console.log('Altegio payload:', JSON.stringify(payload));
+    /**
+     * ОЖИДАЕМЫЕ ПОЛЯ (Altegio может прислать больше):
+     * payload.event            -> 'payment.created' | 'payment.canceled' | 'booking.created'
+     * payload.booking.id
+     * payload.booking.service.title
+     * payload.client.phone
+     * payload.client.name
+     * payload.payment.id
+     * payload.payment.amount
+     * payload.payment.method
+     * payload.payment.total_price   (если есть — для определения full)
+     */
 
-    // ⚠️ Пример ручной нормализации (пока тестовая)
+    console.log('RAW ALTEGIO:', JSON.stringify(payload));
+
+    const bookingId = payload?.booking?.id || payload?.booking_id || '';
+    const paymentId = payload?.payment?.id || '';
+    const clientPhone = normalizePhone(payload?.client?.phone || '');
+    const clientName = payload?.client?.name || '';
+    const serviceName = payload?.booking?.service?.title || payload?.service?.title || '';
+
+    if (!bookingId || !clientPhone) {
+      return res.status(400).json({ error: 'bookingId or phone missing' });
+    }
+
+    // --- Определяем тип события
+    let paymentStatus = 'paid';
+    if (payload?.event === 'payment.canceled') paymentStatus = 'canceled';
+
+    const amount = Number(payload?.payment?.amount || 0);
+    const totalPrice = Number(payload?.payment?.total_price || 0);
+
+    let paymentType = 'prepayment';
+    if (totalPrice && amount >= totalPrice) paymentType = 'full';
+
+    // --- Стабильный event_id (защита от дублей)
+    const eventId = `altegio_${bookingId}_${paymentId || payload.event || 'event'}`;
+
     const event = {
-      event_id: `altegio_test_${Date.now()}`,
-      client_phone: normalizePhone(payload?.client?.phone || ''),
-      client_name: payload?.client?.name || '',
-      booking_id: payload?.booking_id || '',
-      service_name: payload?.service?.title || '',
-      payment_type: 'prepayment',
-      payment_amount: payload?.payment?.amount || 0,
+      event_id: eventId,
+      client_phone: clientPhone,
+      client_name: clientName,
+      booking_id: bookingId,
+      service_name: serviceName,
+      payment_type: paymentType,
+      payment_amount: amount,
       payment_method: payload?.payment?.method || '',
-      payment_status: 'paid',
+      payment_status: paymentStatus,
       payment_datetime: new Date().toISOString(),
     };
 
-    if (!event.client_phone) {
-      return res.status(400).json({ error: 'phone missing' });
-    }
-
-    const exists = await eventExists(event.event_id);
-    if (exists) {
+    // --- Дедупликация
+    if (await eventExists(event.event_id)) {
       return res.json({ status: 'duplicate' });
     }
 
     await writeToSheet(event);
-
-    res.json({ status: 'ok' });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error.message });
+    return res.json({ status: 'ok' });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message });
   }
 });
 
