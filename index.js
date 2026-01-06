@@ -5,7 +5,7 @@ import cron from "node-cron";
 const app = express();
 app.use(express.json());
 
-/* ================= CONFIG ================= */
+/* =============== CONFIG =============== */
 
 const AMO_BASE_URL = "https://clinicreformatormen.amocrm.ru";
 const AMO_TOKEN = process.env.AMO_ACCESS_TOKEN;
@@ -20,7 +20,7 @@ const FULLPAYMENT_FIELD_ID = 1077301;
 const PAYMENT_TYPE_FIELD_ID = 1077303;
 const PAYMENT_DATE_FIELD_ID = 1077305;
 
-/* ================= HELPERS ================= */
+/* =============== HELPERS =============== */
 
 function normalizePhone(phone) {
   return phone.replace(/\D/g, "").replace(/^8/, "7");
@@ -40,42 +40,34 @@ async function amoRequest(url, method = "GET", body = null) {
   return res.json();
 }
 
-/* ================= CORE ================= */
+/* =============== CORE LOGIC =============== */
 
 async function processPayment(row) {
   const phone = normalizePhone(row.client_phone);
-  console.log("PHONE:", phone);
+  console.log("Processing phone:", phone);
 
-  // 1. Find contact
+  /* 1. FIND CONTACT */
   const contactsRes = await amoRequest(`/api/v4/contacts?query=${phone}`);
   const contact = contactsRes?._embedded?.contacts?.[0];
+
   if (!contact) {
     console.log("Contact not found");
     return;
   }
 
-  // 2. Get contact with leads
-  const contactFull = await amoRequest(
-    `/api/v4/contacts/${contact.id}?with=leads`
+  /* 2. FIND LEADS VIA LEADS API (CORRECT WAY) */
+  const leadsRes = await amoRequest(
+    `/api/v4/leads?filter[pipeline_id]=${PIPELINE_ID}&filter[contacts][id]=${contact.id}&order[updated_at]=desc&limit=1`
   );
 
-  const leads = contactFull?._embedded?.leads || [];
-  if (!leads.length) {
-    console.log("No leads for contact");
+  const lead = leadsRes?._embedded?.leads?.[0];
+
+  if (!lead) {
+    console.log("No active lead in target pipeline");
     return;
   }
 
-  // 3. Find lead ONLY in required pipeline
-  const targetLead = leads
-    .filter((l) => l.pipeline_id === PIPELINE_ID)
-    .sort((a, b) => b.id - a.id)[0];
-
-  if (!targetLead) {
-    console.log("No lead in target pipeline");
-    return;
-  }
-
-  // 4. Prepare fields
+  /* 3. PREPARE FIELDS */
   const custom_fields_values = [
     {
       field_id: PAYMENT_TYPE_FIELD_ID,
@@ -87,7 +79,7 @@ async function processPayment(row) {
     },
   ];
 
-  let status_id = null;
+  let status_id;
 
   if (row.payment_type === "prepayment") {
     custom_fields_values.push({
@@ -105,24 +97,24 @@ async function processPayment(row) {
     status_id = STATUS_FULLPAYMENT;
   }
 
-  // 5. Update lead
-  await amoRequest(`/api/v4/leads/${targetLead.id}`, "PATCH", {
+  /* 4. UPDATE LEAD */
+  await amoRequest(`/api/v4/leads/${lead.id}`, "PATCH", {
     status_id,
     custom_fields_values,
   });
 
-  console.log(`Lead ${targetLead.id} updated`);
+  console.log(`✅ Lead ${lead.id} updated correctly`);
 }
 
-/* ================= CRON ================= */
+/* =============== CRON =============== */
 
 cron.schedule("*/5 * * * *", async () => {
   console.log("CRON START");
 
-  // 🔴 ЗАГЛУШКА: ЗАМЕНИШЬ НА ЧТЕНИЕ ИЗ SHEETS
+  // временно тест
   const testRow = {
     client_phone: "77077599609",
-    payment_type: "prepayment", // or "full"
+    payment_type: "prepayment",
     payment_amount: 10000,
     payment_method: "kaspi",
   };
@@ -130,7 +122,7 @@ cron.schedule("*/5 * * * *", async () => {
   await processPayment(testRow);
 });
 
-/* ================= SERVICE ================= */
+/* =============== SERVICE =============== */
 
 app.get("/health", (req, res) => res.send("ok"));
 
