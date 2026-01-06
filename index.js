@@ -5,20 +5,22 @@ import cron from "node-cron";
 const app = express();
 app.use(express.json());
 
-/* ================== CONFIG ================== */
+/* ================= CONFIG ================= */
 
 const AMO_BASE_URL = "https://clinicreformatormen.amocrm.ru";
 const AMO_TOKEN = process.env.AMO_ACCESS_TOKEN;
+
+const PIPELINE_ID = 9884630;
+
+const STATUS_PREPAYMENT = 81391378;
+const STATUS_FULLPAYMENT = 79666150;
 
 const PREPAYMENT_FIELD_ID = 1026233;
 const FULLPAYMENT_FIELD_ID = 1077301;
 const PAYMENT_TYPE_FIELD_ID = 1077303;
 const PAYMENT_DATE_FIELD_ID = 1077305;
 
-const STATUS_PREPAYMENT = 81391378;
-const STATUS_FULLPAYMENT = 79666150;
-
-/* ================== HELPERS ================== */
+/* ================= HELPERS ================= */
 
 function normalizePhone(phone) {
   return phone.replace(/\D/g, "").replace(/^8/, "7");
@@ -28,7 +30,7 @@ async function amoRequest(url, method = "GET", body = null) {
   const res = await fetch(`${AMO_BASE_URL}${url}`, {
     method,
     headers: {
-      "Authorization": `Bearer ${AMO_TOKEN}`,
+      Authorization: `Bearer ${AMO_TOKEN}`,
       "Content-Type": "application/json",
     },
     body: body ? JSON.stringify(body) : null,
@@ -38,18 +40,17 @@ async function amoRequest(url, method = "GET", body = null) {
   return res.json();
 }
 
-/* ================== CORE LOGIC ================== */
+/* ================= CORE ================= */
 
 async function processPayment(row) {
   const phone = normalizePhone(row.client_phone);
-  console.log("Processing phone:", phone);
+  console.log("PHONE:", phone);
 
   // 1. Find contact
   const contactsRes = await amoRequest(`/api/v4/contacts?query=${phone}`);
   const contact = contactsRes?._embedded?.contacts?.[0];
-
   if (!contact) {
-    console.log(`Contact not found for phone ${phone}`);
+    console.log("Contact not found");
     return;
   }
 
@@ -58,13 +59,23 @@ async function processPayment(row) {
     `/api/v4/contacts/${contact.id}?with=leads`
   );
 
-  const lead = contactFull?._embedded?.leads?.[0];
-  if (!lead) {
-    console.log(`No leads for contact ${contact.id}`);
+  const leads = contactFull?._embedded?.leads || [];
+  if (!leads.length) {
+    console.log("No leads for contact");
     return;
   }
 
-  // 3. Prepare fields
+  // 3. Find lead ONLY in required pipeline
+  const targetLead = leads
+    .filter((l) => l.pipeline_id === PIPELINE_ID)
+    .sort((a, b) => b.id - a.id)[0];
+
+  if (!targetLead) {
+    console.log("No lead in target pipeline");
+    return;
+  }
+
+  // 4. Prepare fields
   const custom_fields_values = [
     {
       field_id: PAYMENT_TYPE_FIELD_ID,
@@ -94,24 +105,24 @@ async function processPayment(row) {
     status_id = STATUS_FULLPAYMENT;
   }
 
-  // 4. Update lead
-  await amoRequest(`/api/v4/leads/${lead.id}`, "PATCH", {
+  // 5. Update lead
+  await amoRequest(`/api/v4/leads/${targetLead.id}`, "PATCH", {
     status_id,
     custom_fields_values,
   });
 
-  console.log(`Lead ${lead.id} updated`);
+  console.log(`Lead ${targetLead.id} updated`);
 }
 
-/* ================== CRON ================== */
+/* ================= CRON ================= */
 
 cron.schedule("*/5 * * * *", async () => {
   console.log("CRON START");
 
-  // ⚠️ здесь ты позже подставишь чтение из Google Sheets
+  // 🔴 ЗАГЛУШКА: ЗАМЕНИШЬ НА ЧТЕНИЕ ИЗ SHEETS
   const testRow = {
     client_phone: "77077599609",
-    payment_type: "prepayment",
+    payment_type: "prepayment", // or "full"
     payment_amount: 10000,
     payment_method: "kaspi",
   };
@@ -119,7 +130,7 @@ cron.schedule("*/5 * * * *", async () => {
   await processPayment(testRow);
 });
 
-/* ================== HEALTH ================== */
+/* ================= SERVICE ================= */
 
 app.get("/health", (req, res) => res.send("ok"));
 
