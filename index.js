@@ -12,8 +12,8 @@ const AMO_TOKEN = process.env.AMO_TOKEN;
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 
 const PIPELINE_ID = 9884630;
-const STATUS_PREPAYMENT = 81391378;
-const STATUS_FULLPAYMENT = 79666150;
+const STATUS_PREPAYMENT = 81391378;   // Записан / ПРЕДОПЛАТА ПОЛУЧЕНА
+const STATUS_FULLPAYMENT = 79666150;  // ПОЛНОСТЬЮ ОПЛАТИЛ
 
 // ================== GOOGLE ==================
 const auth = new google.auth.GoogleAuth({
@@ -38,7 +38,7 @@ async function processPayments() {
 
   const sheet = await sheetsApi.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
-    range: "Sheet1!A2:E",
+    range: "A2:E", // ✅ универсально, не зависит от имени листа
   });
 
   const rows = sheet.data.values || [];
@@ -50,7 +50,7 @@ async function processPayments() {
 
     console.log("Processing phone:", phone);
 
-    // 1️⃣ FIND CONTACT
+    // 1️⃣ FIND CONTACT BY PHONE
     const contactsRes = await amo.get("/contacts", {
       params: { query: phone },
     });
@@ -63,7 +63,7 @@ async function processPayments() {
 
     console.log("Matched contact ID:", contact.id);
 
-    // 2️⃣ FIND LEAD IN PIPELINE BY CONTACT
+    // 2️⃣ FIND LEAD IN TARGET PIPELINE BY CONTACT
     const leadsRes = await amo.get("/leads", {
       params: {
         "filter[contacts][id]": contact.id,
@@ -81,7 +81,7 @@ async function processPayments() {
 
     console.log("Matched lead ID:", lead.id);
 
-    // 3️⃣ PREPARE FIELDS
+    // 3️⃣ PREPARE CUSTOM FIELDS
     const customFields = [];
 
     if (prepay) {
@@ -103,8 +103,7 @@ async function processPayments() {
         field_id: 1077303,
         values: [
           {
-            enum_id:
-              paymentType === "prepayment" ? 837451 : 837453,
+            enum_id: paymentType === "prepayment" ? 837451 : 837453,
           },
         ],
       });
@@ -117,7 +116,7 @@ async function processPayments() {
       });
     }
 
-    // 4️⃣ UPDATE LEAD + MOVE STAGE
+    // 4️⃣ MOVE STATUS BY PAYMENT TYPE
     const targetStatus =
       paymentType === "prepayment"
         ? STATUS_PREPAYMENT
@@ -130,7 +129,7 @@ async function processPayments() {
       custom_fields_values: customFields,
     });
 
-    console.log("Lead updated:", lead.id);
+    console.log("Lead updated successfully:", lead.id);
   }
 
   console.log("=== PROCESS PAYMENTS END ===");
